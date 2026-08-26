@@ -7,17 +7,20 @@ const binDir = join(__dirname, "..", "node_modules", "youtube-dl-exec", "bin");
 const isWin = process.platform === "win32";
 const binaryName = isWin ? "yt-dlp.exe" : "yt-dlp";
 const binaryPath = join(binDir, binaryName);
+const markerPath = join(binDir, ".static");
 
 if (existsSync(binaryPath)) {
-  console.log(`[ensure-ytdlp] binary already present: ${binaryPath}`);
-  process.exit(0);
+  if (isWin || existsSync(markerPath)) {
+    console.log(`[ensure-ytdlp] binary already present: ${binaryPath}`);
+    process.exit(0);
+  }
 }
 
 const url = isWin
   ? "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-  : "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+  : "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
 
-console.log(`[ensure-ytdlp] downloading ${url}`);
+console.log(`[ensure-ytdlp] downloading static binary ${url}`);
 
 try {
   const res = await fetch(url, {
@@ -34,6 +37,7 @@ try {
     } catch {
       /* ignore */
     }
+    writeFileSync(markerPath, "static");
   }
   console.log(`[ensure-ytdlp] saved ${buf.length} bytes to ${binaryPath}`);
 } catch (e) {
