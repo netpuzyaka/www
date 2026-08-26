@@ -1,0 +1,164 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: #05060f;
+  color: #e7e9f2;
+  overflow: hidden;
+}
+
+::selection {
+  background: rgba(139, 92, 246, 0.35);
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+@keyframes floatOrb {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  33% {
+    transform: translate3d(60px, -50px, 0) scale(1.12);
+  }
+  66% {
+    transform: translate3d(-40px, 40px, 0) scale(0.94);
+  }
+}
+.orb {
+  position: absolute;
+  border-radius: 9999px;
+  background: radial-gradient(circle, var(--orb-color), transparent 70%);
+  filter: blur(70px);
+  opacity: 0.55;
+  pointer-events: none;
+  animation: floatOrb 16s ease-in-out infinite;
+}
+
+@keyframes gridScroll {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 56px;
+  }
+}
+.floor-grid {
+  position: absolute;
+  left: -60%;
+  right: -60%;
+  bottom: -12%;
+  height: 55%;
+  background-image: linear-gradient(rgba(139, 92, 246, 0.13) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.09) 1px, transparent 1px);
+  background-size: 56px 56px;
+  transform: perspective(700px) rotateX(62deg);
+  transform-origin: top center;
+  animation: gridScroll 2.2s linear infinite;
+  mask-image: linear-gradient(to bottom, transparent 0%, rgba(0, 0, 0, 0.9) 30%, transparent 95%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, rgba(0, 0, 0, 0.9) 30%, transparent 95%);
+  pointer-events: none;
+}
+
+.glass {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.text-gradient {
+  background: linear-gradient(90deg, #a78bfa, #e879f9, #22d3ee);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.05) 25%,
+    rgba(255, 255, 255, 0.12) 50%,
+    rgba(255, 255, 255, 0.05) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+}
+
+@keyframes cubeSpin {
+  from {
+    transform: rotateX(0deg) rotateY(0deg);
+  }
+  to {
+    transform: rotateX(360deg) rotateY(360deg);
+  }
+}
+.cube {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  transform-style: preserve-3d;
+  animation: cubeSpin 10s linear infinite;
+}
+.cube .face {
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid rgba(167, 139, 250, 0.85);
+  background: rgba(139, 92, 246, 0.14);
+  box-shadow: 0 0 12px rgba(139, 92, 246, 0.35);
+}
+.cube .f1 {
+  transform: translateZ(13px);
+}
+.cube .f2 {
+  transform: rotateY(180deg) translateZ(13px);
+}
+.cube .f3 {
+  transform: rotateY(90deg) translateZ(13px);
+}
+.cube .f4 {
+  transform: rotateY(-90deg) translateZ(13px);
+}
+.cube .f5 {
+  transform: rotateX(90deg) translateZ(13px);
+}
+.cube .f6 {
+  transform: rotateX(-90deg) translateZ(13px);
+}
+
+@keyframes pulseGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(139, 92, 246, 0);
+  }
+  50% {
+    box-shadow: 0 0 40px 4px rgba(139, 92, 246, 0.22);
+  }
+}
+.glow-focus:focus-within {
+  animation: pulseGlow 2.6s ease-in-out infinite;
+  border-color: rgba(167, 139, 250, 0.55);
+}
