@@ -1,5 +1,7 @@
 import { Innertube } from "youtubei.js";
 import youtubedl from "youtube-dl-exec";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AudioFormat, VideoFormat, VideoInfo } from "./types";
 
 const UA =
@@ -394,6 +396,11 @@ function yyyymmddToIso(s: string | undefined | null): string | null {
 
 async function tryYtDlp(input: string): Promise<{ result: StrategyResult | null; diag: Diag | null }> {
   try {
+    const binName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
+    const binPath = join(process.cwd(), "node_modules", "youtube-dl-exec", "bin", binName);
+    if (!existsSync(binPath)) {
+      return { result: null, diag: { name: "YT-DLP", detail: `binary missing at ${binPath}` } };
+    }
     const raw = (await withTimeout(
       youtubedl(input, { dumpSingleJson: true, noWarnings: true, noPlaylist: true }),
       55000
@@ -482,13 +489,14 @@ async function tryYtDlp(input: string): Promise<{ result: StrategyResult | null;
     };
   } catch (e) {
     const err = e as { stderr?: string };
-    const text = err.stderr || (e instanceof Error ? e.message : "unknown error");
-    const firstLine = String(text)
+    const lines = [String(err.stderr || ""), e instanceof Error ? e.message : String(e)]
+      .join("\n")
       .split("\n")
       .map((l) => l.trim())
-      .filter(Boolean)[0]
-      ?.slice(0, 120);
-    return { result: null, diag: { name: "YT-DLP", detail: firstLine || "failed" } };
+      .filter(Boolean);
+    const firstLine = lines[0]?.slice(0, 140) || "failed";
+    console.error("[novatube] yt-dlp failed:", firstLine);
+    return { result: null, diag: { name: "YT-DLP", detail: firstLine } };
   }
 }
 
@@ -573,10 +581,16 @@ export async function getVideoInfo(input: string): Promise<VideoInfo> {
         msg = "Видео приватное.";
       } else if (/removed|deleted|not found|unavailable/i.test(det)) {
         msg = "Видео удалено или недоступно.";
-      } else if (d.detail && !/no playable|unavailable/i.test(d.detail)) {
-        msg = `Видео недоступно для скачивания (${d.detail.slice(0, 80)}).`;
+      } else {
+        msg = "Видео недоступно для скачивания.";
       }
     }
+    const tail = diags
+      .slice(0, 3)
+      .map((x) => `${x.name}: ${x.detail}`)
+      .join(" | ")
+      .slice(0, 200);
+    if (tail) msg += ` [${tail}]`;
     throw new YoutubeApiError(msg);
   }
 

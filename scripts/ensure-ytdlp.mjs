@@ -1,7 +1,6 @@
-import { createWriteStream, existsSync, mkdirSync, chmodSync } from "node:fs";
+import { writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import https from "node:https";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const binDir = join(__dirname, "..", "node_modules", "youtube-dl-exec", "bin");
@@ -20,46 +19,25 @@ const url = isWin
 
 console.log(`[ensure-ytdlp] downloading ${url}`);
 
-await new Promise((resolve, reject) => {
-  const req = https.get(
-    url,
-    { headers: { "User-Agent": "ensure-ytdlp" } },
-    (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        https
-          .get(res.headers.location, { headers: { "User-Agent": "ensure-ytdlp" } }, (res2) => {
-            pipeAndSave(res2, binaryPath, resolve, reject);
-          })
-          .on("error", reject);
-        res.resume();
-        return;
-      }
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}`));
-        res.resume();
-        return;
-      }
-      pipeAndSave(res, binaryPath, resolve, reject);
-    }
-  );
-  req.on("error", reject);
-});
-
-function pipeAndSave(res, path, resolve, reject) {
-  mkdirSync(dirname(path), { recursive: true });
-  const file = createWriteStream(path, { mode: 0o755 });
-  res.pipe(file);
-  file.on("finish", () => {
-    if (!isWin) {
-      try {
-        chmodSync(path, 0o755);
-      } catch {
-        /* ignore */
-      }
-    }
-    console.log(`[ensure-ytdlp] saved to ${path}`);
-    resolve();
+try {
+  const res = await fetch(url, {
+    redirect: "follow",
+    headers: { "User-Agent": "ensure-ytdlp/1.0" },
   });
-  file.on("error", reject);
-  res.on("error", reject);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  mkdirSync(dirname(binaryPath), { recursive: true });
+  writeFileSync(binaryPath, buf, { mode: 0o755 });
+  if (!isWin) {
+    try {
+      chmodSync(binaryPath, 0o755);
+    } catch {
+      /* ignore */
+    }
+  }
+  console.log(`[ensure-ytdlp] saved ${buf.length} bytes to ${binaryPath}`);
+} catch (e) {
+  console.warn(`[ensure-ytdlp] download failed: ${e instanceof Error ? e.message : e}`);
+  console.warn("[ensure-ytdlp] continuing build; runtime will fall back to innertube clients");
+  process.exit(0);
 }
