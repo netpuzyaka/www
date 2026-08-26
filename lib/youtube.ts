@@ -1,6 +1,6 @@
 import { Innertube } from "youtubei.js";
-import youtubedl from "youtube-dl-exec";
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AudioFormat, VideoFormat, VideoInfo } from "./types";
 
@@ -151,6 +151,8 @@ async function fetchWatchPage(videoId: string) {
   let webAuthor: WebAuthor = null;
   let webLikes: number | null = null;
   let category: string | null = null;
+  let prStreaming: unknown = null;
+  let prVd: unknown = null;
   const idx = html.indexOf("ytInitialPlayerResponse");
   if (idx !== -1) {
     const braceIdx = html.indexOf("{", idx);
@@ -164,13 +166,15 @@ async function fetchWatchPage(videoId: string) {
           if (a && typeof a === "object") webAuthor = a;
           if (typeof vd.likes === "number") webLikes = vd.likes;
           if (typeof vd.category === "string") category = vd.category;
+          prVd = vd;
         }
+        if (pr.streamingData) prStreaming = pr.streamingData;
       } catch {
         /* ignore */
       }
     }
   }
-  return { key, webVer, uploadDate, webAuthor, webLikes, category };
+  return { key, webVer, uploadDate, webAuthor, webLikes, category, prStreaming, prVd };
 }
 
 function parseCompact(value: string, unit: string): number {
@@ -368,22 +372,6 @@ async function yiStrategy(
   };
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      }
-    );
-  });
-}
-
 function yyyymmddToIso(s: string | undefined | null): string | null {
   if (!s || s.length !== 8) return null;
   const y = Number(s.slice(0, 4));
@@ -394,110 +382,246 @@ function yyyymmddToIso(s: string | undefined | null): string | null {
   return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
 }
 
+function runYtDlp(args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const binSrc = join(
+      process.cwd(),
+      "node_modules",
+      "youtube-dl-exec",
+      "bin",
+      process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp"
+    );
+    let bin = binSrc;
+    try {
+      if (!existsSync(binSrc)) throw new Error(`binary missing at ${binSrc}`);
+      const tmpBin = join("/tmp", "novatube-yt-dlp");
+      mkdirSync("/tmp", { recursive: true });
+      copyFileSync(binSrc, tmpBin);
+      chmodSync(tmpBin, 0o755);
+      bin = tmpBin;
+    } catch (e) {
+      reject(e instanceof Error ? e : new Error(String(e)));
+      return;
+    }
+    const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    const t = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }, timeoutMs);
+    child.on("error", (e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(t);
+      if (code === 0) resolve(out);
+      else reject(new Error(err.trim() || `exit code ${code}`));
+    });
+  });
+}
+
 async function tryYtDlp(input: string): Promise<{ result: StrategyResult | null; diag: Diag | null }> {
-  try {
-    const binName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
-    const binPath = join(process.cwd(), "node_modules", "youtube-dl-exec", "bin", binName);
-    if (!existsSync(binPath)) {
-      return { result: null, diag: { name: "YT-DLP", detail: `binary missing at ${binPath}` } };
-    }
-    const raw = (await withTimeout(
-      youtubedl(input, { dumpSingleJson: true, noWarnings: true, noPlaylist: true }),
-      55000
-    )) as {
-      id?: string;
-      title?: string;
-      view_count?: number;
-      like_count?: number;
-      duration?: number;
-      description?: string;
-      thumbnail?: string;
-      channel_id?: string;
-      channel?: string;
-      uploader?: string;
-      channel_url?: string;
-      channel_follower_count?: number;
-      channel_is_verified?: boolean;
-      is_live?: boolean;
-      live_status?: string;
-      upload_date?: string;
-      formats?: {
-        format_id?: string;
-        url?: string;
-        ext?: string;
-        resolution?: string;
-        height?: number;
-        fps?: number;
-        vcodec?: string;
-        acodec?: string;
-        abr?: number;
-        tbr?: number;
-      }[];
-    };
-    if (!raw || !raw.id) return { result: null, diag: { name: "YT-DLP", detail: "no info returned" } };
+  const configs: Array<{ name: string; args: string[]; timeoutMs: number }> = [
+    {
+      name: "default",
+      args: ["--dump-single-json", "--no-warnings", "--no-playlist", input],
+      timeoutMs: 35000,
+    },
+    {
+      name: "android-ios",
+      args: [
+        "--dump-single-json",
+        "--no-warnings",
+        "--no-playlist",
+        "--extractor-args",
+        "youtube:player_client=android,ios",
+        input,
+      ],
+      timeoutMs: 15000,
+    },
+  ];
 
-    const formats: StrategyFormat[] = [];
-    for (const f of raw.formats || []) {
-      if (!f.url || !f.format_id) continue;
-      const ext = String(f.ext || "mp4").toLowerCase();
-      const hasAudio = (f.acodec || "none") !== "none";
-      const hasVideo = (f.vcodec || "none") !== "none";
-      if (!hasAudio && !hasVideo) continue;
-      if (hasAudio && hasVideo) continue;
-      formats.push({
-        itag: Number(f.format_id),
-        url: f.url,
-        mimeType: !hasVideo
-          ? ext === "webm"
-            ? "audio/webm"
-            : ext === "m4a"
-            ? "audio/mp4"
-            : `audio/${ext}`
-          : ext === "webm"
-          ? "video/webm"
-          : "video/mp4",
-        qualityLabel: f.resolution || (f.height ? `${f.height}p` : undefined),
-        height: f.height,
-        fps: f.fps,
-        audioBitrate: f.abr ? Math.round(f.abr * 1000) : f.tbr ? Math.round(f.tbr * 1000) : undefined,
-      });
-    }
+  let lastDiag: Diag | null = null;
+  for (const cfg of configs) {
+    try {
+      const stdout = await runYtDlp(cfg.args, cfg.timeoutMs);
+      const raw = JSON.parse(stdout) as {
+        id?: string;
+        title?: string;
+        view_count?: number;
+        like_count?: number;
+        duration?: number;
+        description?: string;
+        thumbnail?: string;
+        channel_id?: string;
+        channel?: string;
+        uploader?: string;
+        channel_url?: string;
+        channel_follower_count?: number;
+        channel_is_verified?: boolean;
+        is_live?: boolean;
+        live_status?: string;
+        upload_date?: string;
+        formats?: {
+          format_id?: string;
+          url?: string;
+          ext?: string;
+          resolution?: string;
+          height?: number;
+          fps?: number;
+          vcodec?: string;
+          acodec?: string;
+          abr?: number;
+          tbr?: number;
+        }[];
+      };
+      if (!raw || !raw.id) {
+        lastDiag = { name: "YT-DLP", detail: "no info returned" };
+        continue;
+      }
 
-    return {
-      result: {
-        formats,
-        basic: {
-          title: raw.title || "Без названия",
-          views: raw.view_count || 0,
-          duration: Math.round(raw.duration || 0),
-          description: (raw.description || "").slice(0, 400),
-          thumbnail: raw.thumbnail || null,
-          channelId: raw.channel_id || null,
-          authorName: raw.channel || raw.uploader || null,
-          isLive: Boolean(raw.is_live) || raw.live_status === "is_live",
-          isPrivate: false,
-          channelName: raw.channel || raw.uploader || null,
-          subscribers:
-            typeof raw.channel_follower_count === "number" ? raw.channel_follower_count : null,
-          channelUrl: raw.channel_url || null,
-          verified: Boolean(raw.channel_is_verified),
-          uploadDate: yyyymmddToIso(raw.upload_date),
+      const formats: StrategyFormat[] = [];
+      for (const f of raw.formats || []) {
+        if (!f.url || !f.format_id) continue;
+        const ext = String(f.ext || "mp4").toLowerCase();
+        const hasAudio = (f.acodec || "none") !== "none";
+        const hasVideo = (f.vcodec || "none") !== "none";
+        if (!hasAudio && !hasVideo) continue;
+        if (hasAudio && hasVideo) continue;
+        formats.push({
+          itag: Number(f.format_id),
+          url: f.url,
+          mimeType: !hasVideo
+            ? ext === "webm"
+              ? "audio/webm"
+              : ext === "m4a"
+              ? "audio/mp4"
+              : `audio/${ext}`
+            : ext === "webm"
+            ? "video/webm"
+            : "video/mp4",
+          qualityLabel: f.resolution || (f.height ? `${f.height}p` : undefined),
+          height: f.height,
+          fps: f.fps,
+          audioBitrate: f.abr ? Math.round(f.abr * 1000) : f.tbr ? Math.round(f.tbr * 1000) : undefined,
+        });
+      }
+
+      return {
+        result: {
+          formats,
+          basic: {
+            title: raw.title || "Без названия",
+            views: raw.view_count || 0,
+            duration: Math.round(raw.duration || 0),
+            description: (raw.description || "").slice(0, 400),
+            thumbnail: raw.thumbnail || null,
+            channelId: raw.channel_id || null,
+            authorName: raw.channel || raw.uploader || null,
+            isLive: Boolean(raw.is_live) || raw.live_status === "is_live",
+            isPrivate: false,
+            channelName: raw.channel || raw.uploader || null,
+            subscribers: typeof raw.channel_follower_count === "number" ? raw.channel_follower_count : null,
+            channelUrl: raw.channel_url || null,
+            verified: Boolean(raw.channel_is_verified),
+            uploadDate: yyyymmddToIso(raw.upload_date),
+          },
+          likeCount: typeof raw.like_count === "number" ? raw.like_count : null,
         },
-        likeCount: typeof raw.like_count === "number" ? raw.like_count : null,
-      },
-      diag: null,
-    };
-  } catch (e) {
-    const err = e as { stderr?: string };
-    const lines = [String(err.stderr || ""), e instanceof Error ? e.message : String(e)]
-      .join("\n")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
-    const firstLine = lines[0]?.slice(0, 140) || "failed";
-    console.error("[novatube] yt-dlp failed:", firstLine);
-    return { result: null, diag: { name: "YT-DLP", detail: firstLine } };
+        diag: null,
+      };
+    } catch (e) {
+      const text = e instanceof Error ? e.message : String(e);
+      const firstLine =
+        text
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean)[0] || "failed";
+      console.error(`[novatube] yt-dlp (${cfg.name}) failed:`, firstLine);
+      lastDiag = { name: "YT-DLP", detail: firstLine.slice(0, 140) };
+    }
   }
+  return { result: null, diag: lastDiag };
+}
+
+async function watchStrategy(
+  yt: Innertube | null,
+  page: Awaited<ReturnType<typeof fetchWatchPage>> | null,
+  videoId: string
+): Promise<StrategyResult | null> {
+  if (!page?.prStreaming) throw new Error("no streaming data in watch page");
+  const sd = page.prStreaming as { formats?: unknown[]; adaptiveFormats?: unknown[] };
+  const all = [...(sd.formats || []), ...(sd.adaptiveFormats || [])];
+
+  const formats: StrategyFormat[] = [];
+  for (const f of all) {
+    const raw = f as {
+      itag?: number;
+      url?: string;
+      signatureCipher?: string;
+      cipher?: string;
+      mimeType?: string;
+      qualityLabel?: string;
+      height?: number;
+      fps?: number;
+      audioBitrate?: number;
+      bitrate?: number;
+    };
+    if (!raw.itag || !raw.mimeType) continue;
+    let url: string | undefined = raw.url;
+    if (!url && (raw.signatureCipher || raw.cipher) && yt?.session.player) {
+      try {
+        url = await yt.session.player.decipher(raw.url, raw.signatureCipher, raw.cipher);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!url) continue;
+    formats.push({
+      itag: raw.itag,
+      url,
+      mimeType: raw.mimeType,
+      qualityLabel: raw.qualityLabel,
+      height: raw.height,
+      fps: raw.fps,
+      audioBitrate: raw.audioBitrate,
+      bitrate: raw.bitrate,
+    });
+  }
+
+  const vd = page.prVd as {
+    title?: string;
+    viewCount?: string;
+    lengthSeconds?: string;
+    shortDescription?: string;
+    thumbnail?: { thumbnails?: { url?: string }[] };
+    channelId?: string;
+    author?: unknown;
+    isLiveContent?: boolean;
+    isPrivate?: boolean;
+  } | null;
+  return {
+    formats,
+    basic: {
+      title: vd?.title || "Без названия",
+      views: parseInt(vd?.viewCount || "0") || 0,
+      duration: parseInt(vd?.lengthSeconds || "0") || 0,
+      description: vd?.shortDescription || "",
+      thumbnail: pickLast(vd?.thumbnail?.thumbnails),
+      channelId: vd?.channelId || null,
+      authorName: typeof vd?.author === "string" ? vd.author : null,
+      isLive: Boolean(vd?.isLiveContent),
+      isPrivate: Boolean(vd?.isPrivate),
+    },
+    likeCount: null,
+  };
 }
 
 async function fetchLikesFallback(videoId: string, key: string): Promise<number | null> {
@@ -536,6 +660,7 @@ export async function getVideoInfo(input: string): Promise<VideoInfo> {
 
   if (!result) {
     const attempts: Array<[string, () => Promise<StrategyResult | null>]> = [
+      ["WATCH", () => watchStrategy(yt, page, videoId)],
       ["ANDROID", () => rawStrategy("ANDROID", videoId, key, ANDROID_CLIENT, {})],
       ["IOS", () => rawStrategy("IOS", videoId, key, IOS_CLIENT, {})],
       ["YI-ANDROID", () => (yt ? yiStrategy(yt, "ANDROID", videoId) : Promise.resolve(null))],
