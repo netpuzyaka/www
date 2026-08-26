@@ -3,7 +3,7 @@ import { getVideoInfo, YoutubeApiError } from "@/lib/youtube";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
   const url = req.nextUrl.searchParams.get("url")?.trim() ?? "";

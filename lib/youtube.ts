@@ -1,4 +1,5 @@
 import { Innertube } from "youtubei.js";
+import youtubedl from "youtube-dl-exec";
 import type { AudioFormat, VideoFormat, VideoInfo } from "./types";
 
 const UA =
@@ -68,6 +69,11 @@ type StrategyResult = {
     authorName: string | null;
     isLive: boolean;
     isPrivate: boolean;
+    channelName?: string | null;
+    subscribers?: number | null;
+    channelUrl?: string | null;
+    verified?: boolean;
+    uploadDate?: string | null;
   };
   likeCount: number | null;
 };
@@ -171,8 +177,7 @@ function parseCompact(value: string, unit: string): number {
   return Math.round(n * mult);
 }
 
-function parseSubsText(s: string | undefined): number | null {
-  if (!s) return null;
+function parseSubsText(s: string | undefined): number | null {  if (!s) return null;
   const m = s.match(/([\d.,]+)\s*([KMB])\s*subscribers/i) || s.match(/([\d.,]+)\s*([KMB])/i);
   if (!m) return null;
   return parseCompact(m[1], m[2].toUpperCase());
@@ -361,6 +366,132 @@ async function yiStrategy(
   };
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
+function yyyymmddToIso(s: string | undefined | null): string | null {
+  if (!s || s.length !== 8) return null;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(4, 6));
+  const d = Number(s.slice(6, 8));
+  if (!y || !m || !d) return null;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+}
+
+async function tryYtDlp(input: string): Promise<{ result: StrategyResult | null; diag: Diag | null }> {
+  try {
+    const raw = (await withTimeout(
+      youtubedl(input, { dumpSingleJson: true, noWarnings: true, noPlaylist: true }),
+      55000
+    )) as {
+      id?: string;
+      title?: string;
+      view_count?: number;
+      like_count?: number;
+      duration?: number;
+      description?: string;
+      thumbnail?: string;
+      channel_id?: string;
+      channel?: string;
+      uploader?: string;
+      channel_url?: string;
+      channel_follower_count?: number;
+      channel_is_verified?: boolean;
+      is_live?: boolean;
+      live_status?: string;
+      upload_date?: string;
+      formats?: {
+        format_id?: string;
+        url?: string;
+        ext?: string;
+        resolution?: string;
+        height?: number;
+        fps?: number;
+        vcodec?: string;
+        acodec?: string;
+        abr?: number;
+        tbr?: number;
+      }[];
+    };
+    if (!raw || !raw.id) return { result: null, diag: { name: "YT-DLP", detail: "no info returned" } };
+
+    const formats: StrategyFormat[] = [];
+    for (const f of raw.formats || []) {
+      if (!f.url || !f.format_id) continue;
+      const ext = String(f.ext || "mp4").toLowerCase();
+      const hasAudio = (f.acodec || "none") !== "none";
+      const hasVideo = (f.vcodec || "none") !== "none";
+      if (!hasAudio && !hasVideo) continue;
+      if (hasAudio && hasVideo) continue;
+      formats.push({
+        itag: Number(f.format_id),
+        url: f.url,
+        mimeType: !hasVideo
+          ? ext === "webm"
+            ? "audio/webm"
+            : ext === "m4a"
+            ? "audio/mp4"
+            : `audio/${ext}`
+          : ext === "webm"
+          ? "video/webm"
+          : "video/mp4",
+        qualityLabel: f.resolution || (f.height ? `${f.height}p` : undefined),
+        height: f.height,
+        fps: f.fps,
+        audioBitrate: f.abr ? Math.round(f.abr * 1000) : f.tbr ? Math.round(f.tbr * 1000) : undefined,
+      });
+    }
+
+    return {
+      result: {
+        formats,
+        basic: {
+          title: raw.title || "Без названия",
+          views: raw.view_count || 0,
+          duration: Math.round(raw.duration || 0),
+          description: (raw.description || "").slice(0, 400),
+          thumbnail: raw.thumbnail || null,
+          channelId: raw.channel_id || null,
+          authorName: raw.channel || raw.uploader || null,
+          isLive: Boolean(raw.is_live) || raw.live_status === "is_live",
+          isPrivate: false,
+          channelName: raw.channel || raw.uploader || null,
+          subscribers:
+            typeof raw.channel_follower_count === "number" ? raw.channel_follower_count : null,
+          channelUrl: raw.channel_url || null,
+          verified: Boolean(raw.channel_is_verified),
+          uploadDate: yyyymmddToIso(raw.upload_date),
+        },
+        likeCount: typeof raw.like_count === "number" ? raw.like_count : null,
+      },
+      diag: null,
+    };
+  } catch (e) {
+    const err = e as { stderr?: string };
+    const text = err.stderr || (e instanceof Error ? e.message : "unknown error");
+    const firstLine = String(text)
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)[0]
+      ?.slice(0, 120);
+    return { result: null, diag: { name: "YT-DLP", detail: firstLine || "failed" } };
+  }
+}
+
 async function fetchLikesFallback(videoId: string, key: string): Promise<number | null> {
   try {
     const text = await postJson(
@@ -391,31 +522,40 @@ export async function getVideoInfo(input: string): Promise<VideoInfo> {
   const diags: Diag[] = [];
   let result: StrategyResult | null = null;
 
-  const attempts: Array<[string, () => Promise<StrategyResult | null>]> = [
-    ["ANDROID", () => rawStrategy("ANDROID", videoId, key, ANDROID_CLIENT, {})],
-    ["IOS", () => rawStrategy("IOS", videoId, key, IOS_CLIENT, {})],
-    ["YI-ANDROID", () => (yt ? yiStrategy(yt, "ANDROID", videoId) : Promise.resolve(null))],
-    ["YI-IOS", () => (yt ? yiStrategy(yt, "IOS", videoId) : Promise.resolve(null))],
-    ["YI-WEB", () => (yt ? yiStrategy(yt, "WEB", videoId) : Promise.resolve(null))],
-    [
-      "WEB_EMBEDDED",
-      () => rawStrategy("WEB_EMBEDDED", videoId, key, EMBEDDED_CLIENT, { thirdParty: { embedUrl: "https://www.youtube.com/" } }),
-    ],
-    ["TV", () => rawStrategy("TV", videoId, key, TV_CLIENT, { thirdParty: { embedUrl: "https://www.youtube.com/" } })],
-  ];
+  const dlp = await tryYtDlp(input);
+  if (dlp.diag) diags.push(dlp.diag);
+  result = dlp.result;
 
-  for (const [name, fn] of attempts) {
-    try {
-      const r = await fn();
-      if (r && r.formats.length > 0) {
-        result = r;
-        break;
+  if (!result) {
+    const attempts: Array<[string, () => Promise<StrategyResult | null>]> = [
+      ["ANDROID", () => rawStrategy("ANDROID", videoId, key, ANDROID_CLIENT, {})],
+      ["IOS", () => rawStrategy("IOS", videoId, key, IOS_CLIENT, {})],
+      ["YI-ANDROID", () => (yt ? yiStrategy(yt, "ANDROID", videoId) : Promise.resolve(null))],
+      ["YI-IOS", () => (yt ? yiStrategy(yt, "IOS", videoId) : Promise.resolve(null))],
+      ["YI-WEB", () => (yt ? yiStrategy(yt, "WEB", videoId) : Promise.resolve(null))],
+      [
+        "WEB_EMBEDDED",
+        () =>
+          rawStrategy("WEB_EMBEDDED", videoId, key, EMBEDDED_CLIENT, {
+            thirdParty: { embedUrl: "https://www.youtube.com/" },
+          }),
+      ],
+      ["TV", () => rawStrategy("TV", videoId, key, TV_CLIENT, { thirdParty: { embedUrl: "https://www.youtube.com/" } })],
+    ];
+
+    for (const [name, fn] of attempts) {
+      try {
+        const r = await fn();
+        if (r && r.formats.length > 0) {
+          result = r;
+          break;
+        }
+        if (r) diags.push({ name, detail: "no playable formats" });
+        else diags.push({ name, detail: "client unavailable" });
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : "unknown error";
+        diags.push({ name, detail });
       }
-      if (r) diags.push({ name, detail: "no playable formats" });
-      else diags.push({ name, detail: "client unavailable" });
-    } catch (e) {
-      const detail = e instanceof Error ? e.message : "unknown error";
-      diags.push({ name, detail });
     }
   }
 
@@ -444,12 +584,13 @@ export async function getVideoInfo(input: string): Promise<VideoInfo> {
   if (result.basic.isPrivate) throw new YoutubeApiError("Видео приватное.");
 
   const channelId = result.basic.channelId;
-  let channelName: string | null = result.basic.authorName;
-  let subscribers: number | null = null;
+  let channelName: string | null = result.basic.authorName || result.basic.channelName || null;
+  let subscribers: number | null = result.basic.subscribers ?? null;
   let avatar: string | null = null;
-  let channelUrl: string | null = null;
-  let verified = false;
+  let channelUrl: string | null = result.basic.channelUrl || null;
+  let verified = result.basic.verified || false;
   let likes = result.likeCount;
+  const uploadDate = result.basic.uploadDate || page?.uploadDate || null;
 
   const jobs: Promise<void>[] = [];
 
@@ -598,7 +739,7 @@ export async function getVideoInfo(input: string): Promise<VideoInfo> {
       duration: result.basic.duration,
       views: result.basic.views,
       likes,
-      uploadDate: page?.uploadDate || null,
+      uploadDate,
       description: result.basic.description,
       thumbnail: result.basic.thumbnail,
       category: page?.category || null,
